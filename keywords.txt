@@ -1,0 +1,20 @@
+# One GS1 incoming-products search term per line. Edit this list as needed.
+יין
+בירה
+וודקה
+וויסקי
+ויסקי
+ג'ין
+רום
+טקילה
+ליקר
+ערק
+ברנדי
+קוניאק
+שמפניה
+מבעבע
+סיידר
+ורמוט
+אפריטיף
+קוקטייל
+אלכוהול
