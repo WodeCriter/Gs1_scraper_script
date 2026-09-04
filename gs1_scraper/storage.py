@@ -8,7 +8,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import CSV_COLUMNS, ProductRecord, normalize_barcode
+from .models import (
+    CSV_COLUMNS,
+    ProductRecord,
+    normalize_barcode,
+    raw_data_for_types,
+    types_from_raw_data,
+)
 
 
 def checkpoint_path_for(output_path: Path) -> Path:
@@ -28,6 +34,22 @@ def _write_csv_row(path: Path, columns: tuple[str, ...], row: dict[str, str]) ->
         if is_new:
             writer.writeheader()
         writer.writerow(row)
+
+
+def _replace_csv_rows(
+    path: Path,
+    columns: tuple[str, ...],
+    rows: list[dict[str, str]],
+) -> None:
+    """Atomically rewrite the export after enriching an existing duplicate row."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    with temporary_path.open("w", encoding="utf-8-sig", newline="") as file_handle:
+        writer = csv.DictWriter(file_handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+    temporary_path.replace(path)
 
 
 @dataclass
@@ -112,13 +134,14 @@ class ProductStore:
         self.output_path = output_path
         self.checkpoint = Checkpoint.load(checkpoint_path_for(output_path))
         self.seen_barcodes = set(self.checkpoint.exported_barcodes)
-        self._load_existing_barcodes()
+        self._rows_by_barcode: dict[str, dict[str, str]] = {}
+        self._load_existing_rows()
 
     @property
     def completed_keywords(self) -> set[str]:
         return self.checkpoint.completed_keywords
 
-    def _load_existing_barcodes(self) -> None:
+    def _load_existing_rows(self) -> None:
         if not self.output_path.exists() or self.output_path.stat().st_size == 0:
             return
         with self.output_path.open("r", encoding="utf-8-sig", newline="") as file_handle:
@@ -129,20 +152,52 @@ class ProductStore:
                 )
             for row in reader:
                 if barcode := normalize_barcode(row.get("barcode")):
+                    normalized_row = {
+                        column: str(row.get(column) or "") for column in CSV_COLUMNS
+                    }
                     self.seen_barcodes.add(barcode)
+                    self._rows_by_barcode[barcode] = normalized_row
 
     def write(self, record: ProductRecord) -> WriteResult:
         barcode = normalize_barcode(record.barcode)
         if not barcode:
             return WriteResult(written=False, reason="missing_barcode")
+
+        incoming_row = record.to_csv_row()
+        existing_row = self._rows_by_barcode.get(barcode)
         if barcode in self.seen_barcodes:
+            if existing_row is not None:
+                merged_row = self._merge_duplicate_row(existing_row, incoming_row)
+                if merged_row != existing_row:
+                    self._rows_by_barcode[barcode] = merged_row
+                    _replace_csv_rows(
+                        self.output_path,
+                        CSV_COLUMNS,
+                        list(self._rows_by_barcode.values()),
+                    )
+                    return WriteResult(written=False, reason="merged_duplicate")
             return WriteResult(written=False, reason="duplicate_barcode")
 
-        _write_csv_row(self.output_path, CSV_COLUMNS, record.to_csv_row())
+        _write_csv_row(self.output_path, CSV_COLUMNS, incoming_row)
+        self._rows_by_barcode[barcode] = incoming_row
         self.seen_barcodes.add(barcode)
         self.checkpoint.exported_barcodes.add(barcode)
         self.checkpoint.save()
         return WriteResult(written=True)
+
+    @staticmethod
+    def _merge_duplicate_row(
+        existing_row: dict[str, str],
+        incoming_row: dict[str, str],
+    ) -> dict[str, str]:
+        merged_row = dict(existing_row)
+        for field in ("name", "description", "short_description", "image"):
+            if not merged_row[field] and incoming_row[field]:
+                merged_row[field] = incoming_row[field]
+        merged_row["rawData"] = raw_data_for_types(
+            (*types_from_raw_data(existing_row["rawData"]), *types_from_raw_data(incoming_row["rawData"]))
+        )
+        return merged_row
 
     def mark_keyword_complete(self, keyword: str) -> None:
         self.checkpoint.completed_keywords.add(keyword)

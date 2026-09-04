@@ -9,8 +9,13 @@ from playwright.sync_api import FrameLocator, Page, sync_playwright
 from .auth import prepare_manual_login
 from .config import ScraperSettings
 from .detail_parser import ProductDetailParser
-from .models import ProductRecord, with_barcode_fallback
-from .navigation import IncomingProductsNavigator, ProductCandidate
+from .models import (
+    ProductRecord,
+    product_types_from_text,
+    with_barcode_fallback,
+    with_text_fallback,
+)
+from .navigation import IncomingProductsNavigator, NavigationError, ProductCandidate
 from .storage import ErrorLogger, ProductStore
 
 
@@ -49,7 +54,6 @@ class Gs1AlcoholScraper:
                     self.settings.login_timeout_ms,
                 )
                 navigator = IncomingProductsNavigator(page)
-                navigator.open()
 
                 for keyword in keywords:
                     if keyword in self.store.completed_keywords:
@@ -58,17 +62,27 @@ class Gs1AlcoholScraper:
                         continue
 
                     print(f"Searching: {keyword}")
-                    result = navigator.process_keyword(
-                        keyword=keyword,
-                        on_product=lambda frame, candidate: self._handle_product(
-                            frame, candidate, summary
-                        ),
-                        on_failure=lambda candidate, error: self._handle_failure(
-                            candidate, error, summary
-                        ),
-                        on_attempt=lambda _candidate: self._record_attempt(summary),
-                        should_stop=lambda: self._limit_reached(summary),
-                    )
+                    try:
+                        result = navigator.process_keyword(
+                            keyword=keyword,
+                            on_product=lambda frame, candidate: self._handle_product(
+                                frame, candidate, summary
+                            ),
+                            on_failure=lambda candidate, error: self._handle_failure(
+                                candidate, error, summary
+                            ),
+                            on_attempt=lambda _candidate: self._record_attempt(summary),
+                            should_stop=lambda: self._limit_reached(summary),
+                        )
+                    except NavigationError as error:
+                        summary.issues += 1
+                        self.error_logger.write(
+                            event="keyword_navigation_failure",
+                            keyword=keyword,
+                            message=f"{type(error).__name__}: {error}",
+                        )
+                        print(f"Skipping unavailable keyword for now: {keyword}")
+                        continue
                     if result.completed:
                         self.store.mark_keyword_complete(keyword)
                         summary.completed_keywords += 1
@@ -89,10 +103,25 @@ class Gs1AlcoholScraper:
         candidate: ProductCandidate,
         summary: RunSummary,
     ) -> None:
-        extracted = with_barcode_fallback(
-            self.detail_parser.extract_from_frame(frame), candidate.barcode_hint
+        extracted = with_text_fallback(
+            with_barcode_fallback(
+                self.detail_parser.extract_from_frame(frame), candidate.barcode_hint
+            ),
+            candidate.source_description,
         )
-        record = ProductRecord.from_extracted(extracted)
+        product_types = product_types_from_text(
+            candidate.source_gpc,
+            extracted.name,
+            extracted.description,
+            extracted.short_description,
+        )
+        if not product_types:
+            product_types = product_types_from_text(candidate.keyword)
+        record = ProductRecord.from_extracted(
+            extracted,
+            image=candidate.image_url,
+            product_types=product_types,
+        )
         if not record.barcode:
             summary.missing_barcodes += 1
             summary.issues += 1
@@ -107,7 +136,7 @@ class Gs1AlcoholScraper:
         result = self.store.write(record)
         if result.written:
             summary.exported += 1
-        elif result.reason == "duplicate_barcode":
+        elif result.reason in {"duplicate_barcode", "merged_duplicate"}:
             summary.duplicates += 1
         else:
             summary.missing_barcodes += 1

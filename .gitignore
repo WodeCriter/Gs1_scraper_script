@@ -1,1 +1,7 @@
 ./.env
+.venv/
+output/
+*.checkpoint.json
+*.errors.csv
+gs1_scraper_failure.png
+__pycache__/

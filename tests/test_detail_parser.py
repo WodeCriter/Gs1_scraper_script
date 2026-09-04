@@ -8,6 +8,7 @@ from gs1_scraper.models import (
     ProductRecord,
     normalize_barcode,
     with_barcode_fallback,
+    with_text_fallback,
 )
 from tests.fixtures import PRODUCT_LABEL_PAIRS
 
@@ -52,3 +53,13 @@ class DetailParserTests(unittest.TestCase):
             ExtractedProduct(barcode="7290018359822"), "7290018359815"
         )
         self.assertEqual(detail_product.barcode, "7290018359822")
+
+    def test_table_description_fills_blank_iframe_text_fields(self) -> None:
+        product = with_text_fallback(
+            ExtractedProduct(barcode="7290018359815"),
+            "יין אדום לדוגמה 750 מל",
+        )
+
+        self.assertEqual(product.name, "יין אדום לדוגמה 750 מל")
+        self.assertEqual(product.description, "יין אדום לדוגמה 750 מל")
+        self.assertEqual(product.short_description, "יין אדום לדוגמה 750 מל")

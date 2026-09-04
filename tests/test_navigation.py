@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from gs1_scraper.models import row_signature
-from gs1_scraper.navigation import build_product_candidate, table_total
+from gs1_scraper.navigation import build_product_candidate, is_empty_result, table_total
 from tests.fixtures import DETAIL_HREF, TABLE_INFO_ALL, TABLE_INFO_PAGED, TABLE_ROW_TEXTS
 
 
@@ -25,10 +25,16 @@ class NavigationFixtureTests(unittest.TestCase):
             gtin="7290018359815",
             row_text=TABLE_ROW_TEXTS[0],
             position=0,
+            source_description="יין אדום לדוגמה",
+            image_source="https://images.example.test/wine.jpg",
+            source_gpc="יין - רגיל",
         )
         self.assertIsNotNone(candidate)
         assert candidate is not None
         self.assertEqual(candidate.barcode_hint, "7290018359815")
+        self.assertEqual(candidate.source_description, "יין אדום לדוגמה")
+        self.assertEqual(candidate.image_url, "https://images.example.test/wine.jpg")
+        self.assertEqual(candidate.source_gpc, "יין - רגיל")
         self.assertEqual(
             candidate.detail_url,
             "https://retailer.gs1ildigital.org/web/" + DETAIL_HREF,
@@ -48,3 +54,8 @@ class NavigationFixtureTests(unittest.TestCase):
             position=0,
         )
         self.assertIsNone(candidate)
+
+    def test_zero_total_is_a_normal_empty_result(self) -> None:
+        total = table_total("0 עד 0 מתוך 0 רשומות")
+        self.assertTrue(is_empty_result(total, product_row_count=0))
+        self.assertFalse(is_empty_result(total, product_row_count=1))

@@ -21,7 +21,7 @@ python main.py --fresh --max-products 1
 python main.py
 ```
 
-The first command is a safe manual smoke test. The normal command writes `output/gs1_alcohol_products.csv`, resumes from its checkpoint, and skips duplicate barcodes across all keywords. It never toggles the table's bulk-selection checkbox or performs accept/reject actions.
+The first command is a safe manual smoke test. The normal command writes `output/gs1_alcohol_products.csv`, resumes from its checkpoint, and keeps one row per barcode across all keywords. It never toggles the table's bulk-selection checkbox or performs accept/reject actions.
 
 Use a new output file when needed:
 
@@ -29,4 +29,8 @@ Use a new output file when needed:
 python main.py --output output/my_export.csv
 ```
 
-Pass `--fresh` only when you intentionally want to delete the selected CSV, checkpoint, and issue log before running. Products with missing descriptions are retained with blank cells and recorded in the adjacent `.errors.csv` file. Products without a valid barcode are skipped and logged.
+The export columns are `retailerId`, `externalId`, `barcode`, `name`, `description`, `short_description`, `category`, `image`, and `rawData`. `image` contains the GS1 image URL. `rawData` is JSON such as `{"type":["wine","liqueur"]}` and merges types when a product appears through more than one keyword.
+
+The incoming table's `תיאור מוצר` is used when the detail iframe does not expose name or description fields. A normal zero-result keyword is marked complete and the scraper proceeds to the next one. If the whole table fails to load, that keyword is logged and left incomplete so a later run can retry it.
+
+Pass `--fresh` only when you intentionally want to delete the selected CSV, checkpoint, and issue log before running. The enriched schema is not compatible with the prior seven-column CSV, so rebuild the existing export with `--fresh` or choose a new `--output` path. Products without a valid barcode are skipped and logged.

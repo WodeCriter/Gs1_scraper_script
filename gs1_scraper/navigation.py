@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from playwright.sync_api import (
     Error as PlaywrightError,
@@ -15,17 +15,45 @@ from playwright.sync_api import (
 )
 
 from .config import INCOMING_PRODUCTS_URL
-from .models import normalize_barcode, row_signature
+from .models import clean_text, normalize_barcode, row_signature
 
 
 TABLE_SELECTOR = "#dt_incoming_products"
 SEARCH_SELECTOR = "input[aria-controls='dt_incoming_products']"
 LENGTH_SELECTOR = "select[name='dt_incoming_products_length']"
 ROWS_SELECTOR = f"{TABLE_SELECTOR} tbody tr"
+EMPTY_RESULT_SELECTOR = f"{ROWS_SELECTOR} td.dataTables_empty"
 INFO_SELECTOR = "#dt_incoming_products_info"
 PROCESSING_SELECTOR = "#dt_incoming_products_processing"
 DETAIL_BUTTON_SELECTOR = "button[ui-sref*='app.task.product_info'][href]"
 NEXT_SELECTOR = "#dt_incoming_products_next"
+
+TABLE_SNAPSHOT_SCRIPT = r"""
+(body) => {
+  const clean = (value) => (value || "").replace(/\s+/g, " ").trim();
+  const cellText = (cells, index) => clean(
+    cells[index] && (cells[index].innerText || cells[index].textContent)
+  );
+  return Array.from(body.querySelectorAll(":scope > tr")).map((row, position) => {
+    const cells = row.querySelectorAll(":scope > td");
+    const button = row.querySelector(
+      "button[ui-sref*='app.task.product_info'][href]"
+    );
+    const image = row.querySelector("td.prod-img img");
+    return {
+      position,
+      detailHref: button && button.getAttribute("href"),
+      gtin: cellText(cells, 1),
+      rowText: clean(row.innerText || row.textContent),
+      sourceDescription: cellText(cells, 8),
+      imageSource: image && (
+        image.getAttribute("src") || image.getAttribute("ng-src")
+      ),
+      sourceGpc: cellText(cells, 14),
+    };
+  });
+}
+"""
 
 
 class NavigationError(RuntimeError):
@@ -38,6 +66,9 @@ class ProductCandidate:
     detail_url: str
     barcode_hint: str
     signature: str
+    source_description: str
+    image_url: str
+    source_gpc: str
 
 
 @dataclass(frozen=True)
@@ -63,6 +94,25 @@ def table_total(info_text: str) -> int | None:
     return int(numbers[-1].replace(",", ""))
 
 
+def is_empty_result(total: int | None, product_row_count: int) -> bool:
+    """Identify DataTables' normal zero-result state without treating it as a failure."""
+
+    return total == 0 and product_row_count == 0
+
+
+def normalize_image_url(base_url: str, image_source: str | None) -> str:
+    """Keep only HTTP(S) image URLs and resolve relative GS1 paths."""
+
+    candidate = clean_text(image_source)
+    if not candidate:
+        return ""
+    resolved = urljoin(base_url, candidate)
+    parsed = urlparse(resolved)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return resolved
+
+
 def build_product_candidate(
     *,
     keyword: str,
@@ -71,6 +121,9 @@ def build_product_candidate(
     gtin: str,
     row_text: str,
     position: int,
+    source_description: str = "",
+    image_source: str = "",
+    source_gpc: str = "",
 ) -> ProductCandidate | None:
     """Build a direct-detail candidate from a table row without clicking it."""
 
@@ -81,6 +134,9 @@ def build_product_candidate(
         detail_url=urljoin(base_url, detail_href),
         barcode_hint=normalize_barcode(gtin),
         signature=row_signature(row_text, position),
+        source_description=clean_text(source_description),
+        image_url=normalize_image_url(base_url, image_source),
+        source_gpc=clean_text(source_gpc),
     )
 
 
@@ -128,11 +184,13 @@ class IncomingProductsNavigator:
     def apply_search(self, keyword: str) -> None:
         self._wait_for_table()
         previous_state = self._read_table_state()
+        update_token = self._start_table_update_tracker()
         self.page.locator(SEARCH_SELECTOR).first.fill(keyword)
         self._wait_for_table_update(
             expected_search=keyword,
             expected_length=previous_state.length,
             previous_state=previous_state,
+            update_token=update_token,
             allow_unchanged=previous_state.search == keyword,
         )
 
@@ -143,17 +201,21 @@ class IncomingProductsNavigator:
         length_select = self.page.locator(LENGTH_SELECTOR).first
         if length_select.input_value() != "-1":
             previous_state = self._read_table_state()
+            update_token = self._start_table_update_tracker()
             length_select.select_option("-1")
             total_before = table_total(previous_state.info)
             self._wait_for_table_update(
                 expected_search=previous_state.search,
                 expected_length="-1",
                 previous_state=previous_state,
+                update_token=update_token,
                 # Fewer than 16 matches may render identically after the selection.
                 allow_unchanged=total_before is not None and total_before <= 15,
             )
 
         total = table_total(self._read_table_state().info)
+        if self._has_empty_result(total):
+            return True
         return total is not None and self._current_product_row_count() >= total
 
     def _collect_candidates(self, keyword: str) -> list[ProductCandidate]:
@@ -179,22 +241,26 @@ class IncomingProductsNavigator:
         return candidates
 
     def _snapshot_current_page_candidates(self, keyword: str) -> list[ProductCandidate]:
-        rows = self.page.locator(ROWS_SELECTOR)
+        raw_rows = self.page.locator(f"{TABLE_SELECTOR} tbody").evaluate(
+            TABLE_SNAPSHOT_SCRIPT
+        )
+        if not isinstance(raw_rows, list):
+            return []
         candidates: list[ProductCandidate] = []
         seen_urls: set[str] = set()
-        for position in range(rows.count()):
-            row = rows.nth(position)
-            button = row.locator(DETAIL_BUTTON_SELECTOR).first
-            detail_href = button.get_attribute("href") if button.count() else None
-            cells = row.locator("td")
-            gtin = cells.nth(1).inner_text() if cells.count() >= 2 else ""
+        for raw_row in raw_rows:
+            if not isinstance(raw_row, dict):
+                continue
             candidate = build_product_candidate(
                 keyword=keyword,
                 base_url=self.page.url,
-                detail_href=detail_href or "",
-                gtin=gtin,
-                row_text=row.inner_text(),
-                position=position,
+                detail_href=str(raw_row.get("detailHref") or ""),
+                gtin=str(raw_row.get("gtin") or ""),
+                row_text=str(raw_row.get("rowText") or ""),
+                position=int(raw_row.get("position") or 0),
+                source_description=str(raw_row.get("sourceDescription") or ""),
+                image_source=str(raw_row.get("imageSource") or ""),
+                source_gpc=str(raw_row.get("sourceGpc") or ""),
             )
             if candidate and candidate.detail_url not in seen_urls:
                 seen_urls.add(candidate.detail_url)
@@ -202,10 +268,18 @@ class IncomingProductsNavigator:
         return candidates
 
     def _current_product_row_count(self) -> int:
-        rows = self.page.locator(ROWS_SELECTOR)
-        return sum(
-            rows.nth(position).locator(DETAIL_BUTTON_SELECTOR).count() > 0
-            for position in range(rows.count())
+        return int(
+            self.page.locator(f"{TABLE_SELECTOR} tbody").evaluate(
+                """(body) => body.querySelectorAll(
+                    "button[ui-sref*='app.task.product_info'][href]"
+                ).length"""
+            )
+        )
+
+    def _has_empty_result(self, total: int | None) -> bool:
+        return (
+            self.page.locator(EMPTY_RESULT_SELECTOR).count() > 0
+            or is_empty_result(total, self._current_product_row_count())
         )
 
     def _open_candidate(self, candidate: ProductCandidate) -> FrameLocator:
@@ -267,17 +341,47 @@ class IncomingProductsNavigator:
             body_text=self.page.locator(f"{TABLE_SELECTOR} tbody").inner_text(),
         )
 
+    def _start_table_update_tracker(self) -> int:
+        """Track DataTables draws even when two zero-result messages have identical text."""
+
+        return int(
+            self.page.evaluate(
+                """() => {
+                    const table = document.querySelector("#dt_incoming_products");
+                    if (!table) return -1;
+                    window.__gs1TableUpdateObserver?.disconnect();
+                    const state = { version: 0 };
+                    const advance = () => { state.version += 1; };
+                    const observer = new MutationObserver(advance);
+                    observer.observe(table, {
+                        childList: true,
+                        subtree: true,
+                        characterData: true,
+                    });
+                    if (window.jQuery) {
+                        window.jQuery(table)
+                            .off("draw.dt.gs1Scraper")
+                            .on("draw.dt.gs1Scraper", advance);
+                    }
+                    window.__gs1TableUpdateState = state;
+                    window.__gs1TableUpdateObserver = observer;
+                    return state.version;
+                }"""
+            )
+        )
+
     def _wait_for_table_update(
         self,
         *,
         expected_search: str,
         expected_length: str,
         previous_state: TableState,
+        update_token: int,
         allow_unchanged: bool,
     ) -> None:
         try:
             self.page.wait_for_function(
-                """({ expectedSearch, expectedLength, previous, allowUnchanged }) => {
+                """({ expectedSearch, expectedLength, previous, updateToken, allowUnchanged }) => {
                     const input = document.querySelector("input[aria-controls='dt_incoming_products']");
                     const lengthSelect = document.querySelector(
                         "select[name='dt_incoming_products_length']"
@@ -290,12 +394,14 @@ class IncomingProductsNavigator:
                     const infoText = (info && info.innerText) || "";
                     const bodyText = (body && body.innerText) || "";
                     const changed = infoText !== previous.info || bodyText !== previous.body_text;
+                    const tracker = window.__gs1TableUpdateState;
+                    const redrawn = tracker && tracker.version > updateToken;
                     return input
                         && lengthSelect
                         && input.value === expectedSearch
                         && lengthSelect.value === expectedLength
                         && !processingVisible
-                        && (changed || allowUnchanged);
+                        && (changed || redrawn || allowUnchanged);
                 }""",
                 arg={
                     "expectedSearch": expected_search,
@@ -304,6 +410,7 @@ class IncomingProductsNavigator:
                         "info": previous_state.info,
                         "body_text": previous_state.body_text,
                     },
+                    "updateToken": update_token,
                     "allowUnchanged": allow_unchanged,
                 },
                 timeout=self.timeout_ms,
@@ -323,11 +430,13 @@ class IncomingProductsNavigator:
             return False
 
         previous_state = self._read_table_state()
+        update_token = self._start_table_update_tracker()
         control.click()
         self._wait_for_table_update(
             expected_search=previous_state.search,
             expected_length=previous_state.length,
             previous_state=previous_state,
+            update_token=update_token,
             allow_unchanged=False,
         )
         return True
