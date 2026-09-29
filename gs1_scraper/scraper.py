@@ -16,6 +16,7 @@ from .models import (
     with_text_fallback,
 )
 from .navigation import IncomingProductsNavigator, NavigationError, ProductCandidate
+from .searches import SearchKind, SearchTask, keyword_search_tasks
 from .storage import ErrorLogger, ProductStore
 
 
@@ -26,10 +27,16 @@ class RunSummary:
     duplicates: int = 0
     missing_barcodes: int = 0
     issues: int = 0
-    completed_keywords: int = 0
+    completed_searches: int = 0
+
+    @property
+    def completed_keywords(self) -> int:
+        """Retain the prior summary attribute for callers of keyword mode."""
+
+        return self.completed_searches
 
 
-class Gs1AlcoholScraper:
+class Gs1Scraper:
     def __init__(
         self,
         settings: ScraperSettings,
@@ -41,7 +48,8 @@ class Gs1AlcoholScraper:
         self.error_logger = error_logger
         self.detail_parser = ProductDetailParser()
 
-    def run(self, keywords: list[str]) -> RunSummary:
+    def run(self, searches: list[SearchTask] | list[str]) -> RunSummary:
+        tasks = self._normalize_searches(searches)
         summary = RunSummary()
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=False)
@@ -55,18 +63,19 @@ class Gs1AlcoholScraper:
                 )
                 navigator = IncomingProductsNavigator(page)
 
-                for keyword in keywords:
-                    if keyword in self.store.completed_keywords:
-                        print(f"Skipping completed keyword: {keyword}")
-                        summary.completed_keywords += 1
+                for task in tasks:
+                    if task.checkpoint_key in self.store.completed_searches:
+                        print(f"Skipping completed search: {task.query}")
+                        summary.completed_searches += 1
                         continue
 
-                    print(f"Searching: {keyword}")
+                    print(f"Searching: {task.query}")
                     try:
-                        result = navigator.process_keyword(
-                            keyword=keyword,
+                        result = navigator.process_search(
+                            query=task.query,
+                            result_policy=task.result_policy,
                             on_product=lambda frame, candidate: self._handle_product(
-                                frame, candidate, summary
+                                frame, candidate, task, summary
                             ),
                             on_failure=lambda candidate, error: self._handle_failure(
                                 candidate, error, summary
@@ -77,15 +86,18 @@ class Gs1AlcoholScraper:
                     except NavigationError as error:
                         summary.issues += 1
                         self.error_logger.write(
-                            event="keyword_navigation_failure",
-                            keyword=keyword,
+                            event=f"{task.kind.value}_navigation_failure",
+                            keyword=task.query,
+                            barcode=task.expected_barcode,
                             message=f"{type(error).__name__}: {error}",
                         )
-                        print(f"Skipping unavailable keyword for now: {keyword}")
+                        print(f"Skipping unavailable search for now: {task.query}")
                         continue
                     if result.completed:
-                        self.store.mark_keyword_complete(keyword)
-                        summary.completed_keywords += 1
+                        if task.kind is SearchKind.PRODUCT and result.discovered == 0:
+                            self._record_product_not_found(task, summary)
+                        self.store.mark_search_complete(task.checkpoint_key)
+                        summary.completed_searches += 1
                     else:
                         print("Product limit reached; progress was saved for a later resume.")
                         break
@@ -97,10 +109,21 @@ class Gs1AlcoholScraper:
                 browser.close()
         return summary
 
+    @staticmethod
+    def _normalize_searches(
+        searches: list[SearchTask] | list[str],
+    ) -> list[SearchTask]:
+        if all(isinstance(search, str) for search in searches):
+            return keyword_search_tasks([str(search) for search in searches])
+        if not all(isinstance(search, SearchTask) for search in searches):
+            raise TypeError("Searches must contain only SearchTask values or only strings")
+        return list(searches)
+
     def _handle_product(
         self,
         frame: FrameLocator,
         candidate: ProductCandidate,
+        task: SearchTask,
         summary: RunSummary,
     ) -> None:
         extracted = with_text_fallback(
@@ -109,14 +132,16 @@ class Gs1AlcoholScraper:
             ),
             candidate.source_description,
         )
-        product_types = product_types_from_text(
-            candidate.source_gpc,
-            extracted.name,
-            extracted.description,
-            extracted.short_description,
-        )
-        if not product_types:
-            product_types = product_types_from_text(candidate.keyword)
+        product_types: tuple[str, ...] = ()
+        if task.kind is SearchKind.KEYWORD:
+            product_types = product_types_from_text(
+                candidate.source_gpc,
+                extracted.name,
+                extracted.description,
+                extracted.short_description,
+            )
+            if not product_types:
+                product_types = product_types_from_text(candidate.keyword)
         record = ProductRecord.from_extracted(
             extracted,
             image=candidate.image_url,
@@ -132,6 +157,23 @@ class Gs1AlcoholScraper:
                 message="Product detail did not expose a valid 8-14 digit barcode.",
             )
             return
+
+        if (
+            task.kind is SearchKind.PRODUCT
+            and task.expected_barcode
+            and record.barcode != task.expected_barcode
+        ):
+            summary.issues += 1
+            self.error_logger.write(
+                event="product_barcode_mismatch",
+                keyword=task.query,
+                barcode=record.barcode,
+                row_signature=candidate.signature,
+                message=(
+                    f"Workbook barcode {task.expected_barcode} differs from the first "
+                    f"GS1 result barcode {record.barcode}; exported the GS1 result."
+                ),
+            )
 
         result = self.store.write(record)
         if result.written:
@@ -150,6 +192,19 @@ class Gs1AlcoholScraper:
                 row_signature=candidate.signature,
                 message="Missing: " + ", ".join(missing_fields),
             )
+
+    def _record_product_not_found(
+        self,
+        task: SearchTask,
+        summary: RunSummary,
+    ) -> None:
+        summary.issues += 1
+        self.error_logger.write(
+            event="product_not_found",
+            keyword=task.query,
+            barcode=task.expected_barcode,
+            message="No GS1 results were found for the workbook product name.",
+        )
 
     def _handle_failure(
         self,
@@ -183,3 +238,7 @@ class Gs1AlcoholScraper:
         except Exception:
             # The original failure is more useful than a screenshot failure.
             pass
+
+
+# Keep the original class name import-compatible for existing callers.
+Gs1AlcoholScraper = Gs1Scraper

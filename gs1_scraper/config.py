@@ -15,7 +15,9 @@ INCOMING_PRODUCTS_URL = (
 RETAILER_ID = "b1da0e73-0ce7-4556-a372-2ced574f2161"
 CATEGORY = "2"
 DEFAULT_OUTPUT = Path("output/gs1_alcohol_products.csv")
+DEFAULT_PRODUCT_OUTPUT = Path("output/gs1_specific_products.csv")
 DEFAULT_KEYWORDS_FILE = Path("keywords.txt")
+DEFAULT_PRODUCTS_FILE = Path("100 מוצרים.xlsx")
 
 
 class ConfigurationError(ValueError):
@@ -34,6 +36,7 @@ class ScraperSettings:
     output_path: Path
     keywords_file: Path
     max_products: int | None
+    products_file: Path = DEFAULT_PRODUCTS_FILE
     login_timeout_ms: int = 15 * 60 * 1_000
 
 
@@ -99,6 +102,7 @@ def build_settings(
     keywords_file: Path,
     max_products: int | None,
     env_file: Path,
+    products_file: Path = DEFAULT_PRODUCTS_FILE,
 ) -> ScraperSettings:
     load_env_file(env_file)
     if max_products is not None and max_products <= 0:
@@ -108,4 +112,5 @@ def build_settings(
         output_path=output_path,
         keywords_file=keywords_file,
         max_products=max_products,
+        products_file=products_file,
     )

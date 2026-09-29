@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
+from enum import Enum
 
 from .config import CATEGORY, RETAILER_ID
 
@@ -21,6 +22,18 @@ CSV_COLUMNS = (
     "image",
     "rawData",
 )
+PRODUCT_CSV_COLUMNS = ("Id", *CSV_COLUMNS)
+
+
+class ExportProfile(str, Enum):
+    """Select the stable CSV contract used by one scraper run."""
+
+    KEYWORD = "keyword"
+    PRODUCT = "product"
+
+
+def csv_columns_for(profile: ExportProfile) -> tuple[str, ...]:
+    return PRODUCT_CSV_COLUMNS if profile is ExportProfile.PRODUCT else CSV_COLUMNS
 
 # Keep the output order stable when a product matches more than one alcohol type.
 TYPE_ORDER = (
@@ -207,8 +220,11 @@ class ProductRecord:
             raw_data=raw_data_for_types(product_types),
         )
 
-    def to_csv_row(self) -> dict[str, str]:
-        return {
+    def to_csv_row(
+        self,
+        profile: ExportProfile = ExportProfile.KEYWORD,
+    ) -> dict[str, str]:
+        row = {
             "retailerId": self.retailer_id,
             "externalId": self.external_id,
             "barcode": self.barcode,
@@ -219,6 +235,14 @@ class ProductRecord:
             "image": self.image,
             "rawData": self.raw_data,
         }
+        if profile is ExportProfile.PRODUCT:
+            return {
+                "Id": "",
+                **row,
+                "category": "",
+                "rawData": "",
+            }
+        return row
 
 
 def row_signature(text: str, position: int) -> str:
